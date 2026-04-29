@@ -1,6 +1,6 @@
-# Automation Service
+# JobConcierge — Python Automation Service
 
-A Python FastAPI service that handles browser-based job application form submissions using Playwright. This service is the automation layer of a polyglot microservices system — it receives structured application data from the Spring Boot orchestration service, launches a real browser, fills and submits ATS job application forms, and returns a structured result.
+A Python FastAPI microservice that handles browser-based job application form submissions using Playwright. This is the automation execution layer of the **JobConcierge** polyglot system — it receives structured application payloads from the **NestJS orchestration service**, launches a real Chromium browser with bot-detection evasion, fills and submits ATS job application forms dynamically using LLM-mapped answers, and returns a structured result.
 
 ---
 
@@ -14,59 +14,72 @@ A Python FastAPI service that handles browser-based job application form submiss
 6. [Environment Setup](#environment-setup)
 7. [Running the Service](#running-the-service)
 8. [API Endpoints](#api-endpoints)
-9. [Testing with Postman](#testing-with-postman)
-10. [Testing with cURL](#testing-with-curl)
-11. [Error Handling](#error-handling)
-12. [Logging](#logging)
-13. [Screenshots](#screenshots)
-14. [Related Services](#related-services)
+9. [Bot Detection Evasion](#bot-detection-evasion)
+10. [CAPTCHA Handling](#captcha-handling)
+11. [Supported ATS Platforms](#supported-ats-platforms)
+12. [Error Handling](#error-handling)
+13. [Review Queue Triggers](#review-queue-triggers)
+14. [Logging](#logging)
+15. [Screenshots](#screenshots)
+16. [Related Services](#related-services)
 
 ---
 
 ## Project Overview
 
-The Automation Service is the Python layer of the Job Application Automation System. It is responsible for:
+The Automation Service is the Python execution layer of the JobConcierge system. It is responsible for:
 
-- Receiving application data from the Spring Boot service via a POST request
-- Validating that the CV file exists on the local filesystem before launching the browser
-- Launching a Chromium browser instance via Playwright
-- Navigating to the target job application URL
-- Filling all form fields with human-like typing speed and scroll behaviour
-- Uploading the applicant's CV file
-- Submitting the form and detecting success or failure from the resulting page
-- Capturing screenshots at every major step for debugging and auditability
-- Returning a structured JSON response (SUBMITTED or FAILED) to the Spring Boot service
+- Receiving fully resolved application payloads from the NestJS service (including LLM-mapped answers for dynamic form questions)
+- Launching a persistent Chromium browser context with stealth patches to evade bot detection
+- Navigating to the target ATS job application URL
+- Filling all form fields using human-like typing speed, scroll behaviour, and randomised delays
+- Handling React Select dropdowns, native selects, boolean radio fields, and textarea inputs
+- Downloading the candidate's resume from Supabase Storage and uploading it to the form
+- Detecting and handling GDPR consent checkboxes
+- Detecting email verification prompts post-submission (Greenhouse)
+- Submitting the form and detecting success, validation errors, or CAPTCHA challenges
+- Routing applications that require human intervention to the Review Queue via structured response codes
+- Capturing screenshots at every major step for evidence and debugging
 
-The service does **not** manage any database operations or business logic. That is handled entirely by the Spring Boot orchestration service.
+The service does **not** manage any database operations, LLM mapping, or business logic. All of that is handled by the NestJS orchestration service.
 
 ---
 
 ## Architecture
 
 ```
-Spring Boot Service (Port 8080)
-        |
-        | HTTP POST /submit-application
-        v
-FastAPI Application (Port 8081)
-        |
-        v
-run_in_thread()  ← new event loop per request (Windows asyncio compatibility)
-        |
-        v
-run_automation()  ← Playwright async automation
-        |
-        |-- Navigate to job URL
-        |-- Fill form fields (human-like typing)
-        |-- Upload CV file
-        |-- Submit form
-        |-- Detect success / failure
-        |-- Capture screenshots
-        v
-ApplicationResponse  →  returned to Spring Boot
+NestJS Orchestration Service (Port 3000)
+        │
+        │  HTTP POST /submit-application
+        │  (ApplicationRequest payload with LLM-mapped answers + resume URL)
+        ▼
+FastAPI Application (Port 8000)
+        │
+        ▼
+run_in_executor()  ← isolated event loop per request (Windows asyncio fix)
+        │
+        ▼
+run_automation()  ← Playwright persistent context with stealth patches
+        │
+        ├── Stealth init script applied to browser context
+        ├── Navigate to ATS URL
+        ├── CAPTCHA detection (visibility + size check + badge exclusion)
+        ├── Fill standard identity fields
+        ├── Download resume from Supabase → temp file → upload to form
+        ├── Dynamic question loop (LLM answers by field name)
+        │     ├── input_text / textarea  → human_type()
+        │     ├── select (React Select)  → click → wait → click option
+        │     ├── select (native)        → select_option()
+        │     └── boolean               → radio click with force
+        ├── GDPR consent checkbox
+        ├── Submit form
+        ├── Detect: success / email verification / validation errors / CAPTCHA
+        └── Return ApplicationResponse → NestJS
 ```
 
-> **Note on Windows asyncio:** Playwright requires subprocess creation which conflicts with uvicorn's default event loop on Windows. The service uses a `ThreadPoolExecutor` to run each automation in a fresh isolated event loop, bypassing this limitation.
+> **Note on Windows asyncio:** Playwright requires subprocess creation which conflicts with uvicorn's default event loop on Windows. The service uses a `ThreadPoolExecutor` to run each automation in a fresh isolated event loop per request.
+
+> **Note on primary caller:** This service is designed to be called by the NestJS orchestration service. It can also be called directly from any HTTP client (Postman, cURL, other services) as long as the `ApplicationRequest` schema is satisfied.
 
 ---
 
@@ -78,53 +91,40 @@ ApplicationResponse  →  returned to Spring Boot
 | FastAPI | Latest | REST API framework |
 | Uvicorn | Latest | ASGI server |
 | Playwright | Latest | Browser automation |
-| Pydantic | Latest | Request/response validation |
+| Pydantic | v2 | Request/response validation |
+| httpx | Latest | Async HTTP client for resume download |
+| certifi | Latest | SSL certificate bundle (Windows fix) |
 
 ---
 
 ## Prerequisites
 
-Before running the service ensure the following are installed:
-
-- **Python 3.11** — specifically 3.11.x (see [Environment Setup](#environment-setup))
-- **The Spring Boot Job Application Service** — must be running on port 8080 to send requests to this service
-- **A CV file** on the local filesystem at the path configured in the database (e.g. `C:/resumes/john_doe_cv.pdf`)
+- **Python 3.11** — specifically 3.11.x (3.12/3.13 have Playwright asyncio issues on Windows)
+- **NestJS JobConcierge service** running on port 3000 (primary caller)
+- **Supabase** — resume files must be accessible via public or signed URL
 
 ---
 
 ## Project Structure
 
 ```
-C:/automation/scripts/
+automation/
 │
-├── venv/                  ← Python virtual environment (do not edit)
-├── models.py              ← Pydantic request and response models
-├── automation.py          ← Playwright browser automation logic
-├── main.py                ← FastAPI application and endpoints
-├── requirements.txt       ← Python dependencies
-└── screenshots/           ← Auto-created, stores per-run screenshots
+├── scripts/
+│   ├── main.py                ← FastAPI app, endpoints, Windows asyncio workaround
+│   ├── automation.py          ← Browser launch, stealth patches, dispatch to handlers
+│   ├── models.py              ← Pydantic request/response models
+│   ├── browser_utils.py       ← Shared Playwright utilities (human_type, CAPTCHA detection, etc.)
+│   ├── handlers/
+│   │   ├── greenhouse.py      ← Greenhouse ATS form handler
+│   │   ├── lever.py           ← Lever ATS form handler
+│   │   └── generic.py         ← Generic/fallback handler
+│   └── screenshots/           ← Auto-created, per-run screenshot evidence
+│
+├── venv/                      ← Python virtual environment (do not commit)
+├── requirements.txt
+└── .gitignore
 ```
-
-### File Responsibilities
-
-**models.py**
-Defines the Pydantic data models used for request validation and response serialisation:
-- `ApplicationRequest` — all fields needed to fill and submit a job application form
-- `ApplicationResponse` — status (SUBMITTED/FAILED), optional confirmation, optional error message
-
-**automation.py**
-Contains all Playwright browser automation logic:
-- `scroll_to_element()` — scrolls a field into view before interacting with it
-- `human_type()` — types character by character with randomised delays
-- `select_react_option()` — handles React Select dropdown interactions
-- `safe_screenshot()` — captures screenshots without crashing on failure
-- `fill_greenhouse_form()` — fills all fields on a Greenhouse ATS application form
-- `run_automation()` — main entry point, launches browser, runs form fill, detects result
-
-**main.py**
-FastAPI application with two endpoints and the Windows asyncio workaround:
-- Registers the `/health` and `/submit-application` endpoints
-- Uses `ThreadPoolExecutor` + `run_in_executor` to run Playwright in an isolated event loop
 
 ---
 
@@ -132,133 +132,78 @@ FastAPI application with two endpoints and the Windows asyncio workaround:
 
 ### Step 1 — Install Python 3.11
 
-Download the Python 3.11 installer from:
+Download from:
 ```
 https://www.python.org/downloads/release/python-3119/
 ```
 
-During installation on Windows, check **Add Python to PATH**.
-
-Verify:
+Check **Add Python to PATH** during installation. Verify:
 ```bash
 python --version
 # Must show Python 3.11.x
 ```
 
-> **Important:** Do not use Python 3.12 or 3.13. Playwright has a known asyncio subprocess compatibility issue on Windows with those versions. Python 3.11 is the stable, tested version for this service.
+### Step 2 — Create virtual environment
 
----
-
-### Step 2 — Create a virtual environment
-
-Open a Command Prompt and navigate to the project folder:
-
-```bash
-cd C:\automation\scripts
-```
-
-Create the virtual environment using Python 3.11 explicitly:
-
-```bash
+```powershell
+cd "C:\Users\rapheal\Documents\cyberpurview projects\automation"
 py -3.11 -m venv venv
+.\venv\Scripts\Activate.ps1
 ```
 
-Activate it:
-
-```bash
-venv\Scripts\activate
+If you get a script execution policy error:
+```powershell
+Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser
 ```
-
-You should see `(venv)` at the start of your terminal prompt.
-
----
 
 ### Step 3 — Install dependencies
 
-```bash
+```powershell
 pip install -r requirements.txt
 ```
 
----
-
 ### Step 4 — Install Playwright browsers
 
-```bash
+```powershell
 playwright install chromium
 ```
 
-This downloads the Chromium browser that Playwright uses for automation. Only Chromium is needed.
-
----
-
 ### Step 5 — Verify setup
 
-```bash
-python --version
-# Python 3.11.x
-
-uvicorn --version
-# uvicorn, version x.x.x
+```powershell
+python --version   # Python 3.11.x
+uvicorn --version  # uvicorn, version x.x.x
 ```
 
 ---
 
 ## Running the Service
 
-### Step 1 — Activate the virtual environment
+### Start
+
+```powershell
+cd "C:\Users\rapheal\Documents\cyberpurview projects\automation"
+.\venv\Scripts\Activate.ps1
+cd scripts
+uvicorn main:app --reload --port 8000
+```
+
+### Verify
 
 ```bash
-cd C:\automation\scripts
-venv\Scripts\activate
+curl http://127.0.0.1:8000/health
 ```
 
-### Step 2 — Start the service
-
-```bash
-uvicorn main:app --reload --port 8081
-```
-
-### Step 3 — Verify startup
-
-On successful startup you will see:
-```
-INFO:     Uvicorn running on http://127.0.0.1:8081 (Press CTRL+C to quit)
-INFO:     Application startup complete.
-```
-
-Test the health endpoint:
-```bash
-curl http://127.0.0.1:8081/health
-```
-
-Expected response:
+Expected:
 ```json
-{
-  "status": "Python automation service is running"
-}
+{ "status": "Python automation service is running" }
 ```
 
-### Step 4 — View interactive API docs
+### Stop
 
-FastAPI provides auto-generated interactive documentation. Open in your browser:
-```
-http://127.0.0.1:8081/docs
-```
-
----
-
-### Stopping the service
-
-Press `Ctrl+C` in the terminal where uvicorn is running.
-
----
-
-### Important — zombie process warning
-
-If you see `Access is denied` errors when trying to delete the `venv` folder or restart the service, old uvicorn processes are still running. Check for and kill them:
-
-```bash
-netstat -ano | findstr :8081
+Press `Ctrl+C`. If old processes are blocking port 8000:
+```powershell
+netstat -ano | findstr :8000
 taskkill /PID <PID> /F
 ```
 
@@ -266,221 +211,251 @@ taskkill /PID <PID> /F
 
 ## API Endpoints
 
-Base URL: `http://127.0.0.1:8081`
+Base URL: `http://127.0.0.1:8000`
 
 ### GET /health
 
-Confirms the service is running. Called by the Spring Boot service before sending application requests.
-
-**Response (200 OK):**
 ```json
-{
-  "status": "Python automation service is running"
-}
+{ "status": "Python automation service is running" }
 ```
 
 ---
 
 ### POST /submit-application
 
-Receives application data, runs Playwright browser automation, and returns the result.
+Receives the full application payload from NestJS and runs automation.
 
 **Request Body:**
 ```json
 {
-  "jobUrl": "https://job-boards.greenhouse.io/easyship/jobs/4609487006",
+  "jobUrl": "https://boards.greenhouse.io/easyship/jobs/4396366006",
   "platform": "greenhouse",
-  "firstName": "John",
-  "lastName": "Doe",
-  "email": "johndoe@gmail.com",
-  "phone": "+1234567890",
-  "cvFilePath": "<project_root>/resumes/john_doe_cv.pdf",
+  "firstName": "Rapheal",
+  "lastName": "Miracle",
+  "email": "miraclerapheal14@gmail.com",
+  "phone": "+2349126146712",
+  "linkedIn": "https://www.linkedin.com/in/rapheal-miracle",
+  "address": "Bangalore",
+  "resumeUrl": "https://your-supabase-url/storage/v1/object/public/resumes/resume.pdf",
+  "cvFilePath": null,
   "headless": false,
-  "address": "New York, USA"
+  "salaryExpectation": "120000",
+  "questions": [...],
+  "llmAnswers": {
+    "question_7871023006": "immediately",
+    "question_7802645006": "120000",
+    "question_5792560006": "Yes",
+    "question_7802646006": "https://www.linkedin.com/in/rapheal-miracle",
+    "question_8394481006": "Claude"
+  },
+  "savedAnswers": {}
 }
 ```
-
-###
-Replace <project_root> with your project-folder location.
-
 
 **Request Fields:**
 
 | Field | Type | Required | Description |
 |---|---|---|---|
-| jobUrl | string | Yes | Full URL of the job application form |
-| platform | string | Yes | ATS platform name (e.g. greenhouse) |
-| firstName | string | Yes | Applicant first name |
-| lastName | string | Yes | Applicant last name |
-| email | string | Yes | Applicant email address |
-| phone | string | No | Applicant phone number |
-| cvFilePath | string | Yes | Absolute path to the CV file on the local filesystem |
-| headless | boolean | No | Run browser invisibly (true) or visibly (false). Default: false |
-| address | string | No | Applicant address. Default: New York, USA |
+| jobUrl | string | Yes | Full ATS job application URL |
+| platform | string | Yes | `greenhouse`, `lever`, or `generic` |
+| firstName | string | Yes | Candidate first name |
+| lastName | string | Yes | Candidate last name |
+| email | string | Yes | Candidate email |
+| phone | string | No | Candidate phone number |
+| linkedIn | string | No | LinkedIn profile URL |
+| address | string | No | Candidate location |
+| resumeUrl | string | No | Supabase Storage URL — downloaded to temp file and uploaded |
+| cvFilePath | string | No | Local file path (dev/testing only) |
+| headless | boolean | No | `false` = visible browser (default), `true` = headless |
+| salaryExpectation | string/number | No | Salary for standard salary fields |
+| questions | array | No | Raw ATS questions array from Greenhouse API |
+| llmAnswers | object | No | Field name → answer map produced by Gemini/LLM mapping |
+| savedAnswers | object | No | Previously cached answers |
 
-**Success Response (200 OK):**
+**Success Response:**
 ```json
 {
   "status": "SUBMITTED",
-  "confirmation": "Application submitted for John Doe",
-  "error": null
+  "confirmation": "Application submitted for Rapheal Miracle — email verification pending",
+  "screenshotUrl": "screenshots/gh_04_submitted.png"
 }
 ```
 
-**Failure Response (200 OK):**
+**Review Required Response:**
+```json
+{
+  "status": "REQUIRES_REVIEW",
+  "requiresReview": true,
+  "reviewReason": "CAPTCHA",
+  "step": "PAGE_LOAD"
+}
+```
+
+**Failure Response:**
 ```json
 {
   "status": "FAILED",
-  "confirmation": null,
-  "error": "Form validation failed: This field is required"
-}
-```
-
-**CV not found Response (400 Bad Request):**
-```json
-{
-  "detail": "CV file not found at: C:/resumes/john_doe_cv.pdf"
+  "error": "Form validation failed: This field is required.",
+  "step": "SUBMIT"
 }
 ```
 
 ---
 
-## Testing with Postman
+## Bot Detection Evasion
 
-### Health Check
+The service uses a layered approach to avoid detection as an automated browser:
 
+**1. Persistent browser context** (`launch_persistent_context`)
+Maintains cookies, localStorage, and session data across runs so the browser looks like a returning human user rather than a fresh bot session each time.
+
+**2. Custom stealth init script** (applied via `context.add_init_script`)
+Injected into every page before any scripts run. Patches the key properties that bot detectors check:
+
+| Property | Patch |
+|---|---|
+| `navigator.webdriver` | Set to `undefined` (default is `true` for automation) |
+| `window.chrome` | Populated with realistic runtime object |
+| `navigator.plugins` | Faked as non-empty array |
+| `navigator.languages` | Set to `['en-US', 'en']` |
+| `navigator.permissions` | Returns realistic notification permission state |
+| `WebGL vendor/renderer` | Faked as `Intel Inc.` / `Intel Iris OpenGL Engine` |
+
+**3. Launch flags**
+```python
+'--disable-blink-features=AutomationControlled'
+'--no-sandbox'
+'--disable-dev-shm-usage'
 ```
-Method: GET
-URL:    http://127.0.0.1:8081/health
-```
 
-### Submit an Application
-
-```
-Method:  POST
-URL:     http://127.0.0.1:8081/submit-application
-Headers: Content-Type: application/json
-
-Body (raw JSON):
-{
-  "jobUrl": "https://job-boards.greenhouse.io/easyship/jobs/4609487006",
-  "platform": "greenhouse",
-  "firstName": "John",
-  "lastName": "Doe",
-  "email": "johndoe@gmail.com",
-  "phone": "+1234567890",
-  "cvFilePath": "<project_root>/resumes/john_doe_cv.pdf",
-  "headless": false,
-  "address": "New York, USA"
-}
-```
-###
-Replace <project_root> with your project-folder location.
-
-> **Tip:** Set `headless: false` to watch the browser fill the form in real time. Set `headless: true` to run silently in the background.
+**4. Human-like interactions**
+- `slow_mo=100` — all browser actions slowed by 100ms
+- `human_type()` — character-by-character typing with 60–180ms random keystroke delays
+- `scroll_to_element()` — smooth scroll before every interaction
+- `human_delay()` — random waits between major actions
 
 ---
 
-## Testing with cURL
+## CAPTCHA Handling
 
-### Health Check
+The service distinguishes between real CAPTCHA challenges and decorative/background scoring elements.
 
-```bash
-curl -X GET http://127.0.0.1:8081/health
-```
+**What is NOT a CAPTCHA (ignored):**
+- The `grecaptcha-badge` floating tab — a decorative element present on all Greenhouse forms, ~256px wide but positioned 186px off-screen. Hidden via JS before detection runs.
+- reCAPTCHA v3/enterprise invisible scoring — runs silently in the background with no user interaction. Detected by `size=invisible` in the iframe URL.
 
-### Submit an Application
+**What IS a real CAPTCHA (triggers review):**
+- `bframe` iframes — only appear when an active challenge popup is shown
+- Visible `anchor` iframes wider than 100px that are not the badge
 
-```bash
-curl -X POST http://127.0.0.1:8081/submit-application \
-  -H "Content-Type: application/json" \
-  -d '{
-    "jobUrl": "https://job-boards.greenhouse.io/easyship/jobs/4609487006",
-    "platform": "greenhouse",
-    "firstName": "John",
-    "lastName": "Doe",
-    "email": "johndoe@gmail.com",
-    "phone": "+1234567890",
-    "cvFilePath": "<project_root>/resumes/john_doe_cv.pdf",
-    "headless": false,
-    "address": "New York, USA"
-  }'
-```
+**Detection logic in `check_for_captcha()`:**
+1. Hide `.grecaptcha-badge` via JS evaluation
+2. Check for `bframe` iframes (challenge popup — always real)
+3. Check anchor/widget iframes for visibility AND size > 100px
 
-###
-Replace <project_root> with your project-folder location.
+**When a real CAPTCHA is detected:**
+- `headless=false` — waits 2 minutes for manual solve in the visible browser window
+- `headless=true` — immediately returns `REQUIRES_REVIEW` with `reviewReason: CAPTCHA`
+
+---
+
+## Supported ATS Platforms
+
+| Platform | Handler | Status |
+|---|---|---|
+| Greenhouse | `handlers/greenhouse.py` | ✅ Active |
+| Lever | `handlers/lever.py` | 🔧 In progress |
+| Generic | `handlers/generic.py` | 🔧 Fallback |
+
+**Greenhouse-specific features:**
+- Fetches job questions from `boards-api.greenhouse.io` public API
+- Handles React Select dropdowns (detect by `role="combobox"`, click → wait → click option)
+- Handles native `<select>` elements
+- Handles boolean radio fields with `force=True` click (label overlay workaround)
+- Detects and handles post-submission email verification prompt (8-digit code)
+- GDPR consent checkbox detection and auto-check
+- Resume downloaded from Supabase Storage via httpx with certifi SSL bundle
 
 ---
 
 ## Error Handling
 
-The service handles errors at two levels:
-
-**Request validation (400):** If the CV file does not exist at the specified path, the service returns a 400 immediately before launching any browser.
-
-**Automation errors:** All Playwright errors are caught inside `run_automation()` and returned as a FAILED `ApplicationResponse` with the error message included — the service always returns 200 to the Spring Boot caller and lets Spring Boot decide how to handle a FAILED result.
-
 | Scenario | Behaviour |
 |---|---|
-| CV file not found | 400 Bad Request — no browser launched |
-| Page load timeout | FAILED response with timeout message |
-| Form field not found | FAILED response with selector error |
-| Validation errors on form | FAILED response listing the error messages |
-| Success page detected | SUBMITTED response with confirmation |
-| Unexpected exception | FAILED response with error details |
+| Resume download fails | `FAILED` — `RESUME_UPLOAD` step |
+| Required LLM answer missing | `REQUIRES_REVIEW` — `UNKNOWN_QUESTION` |
+| Real CAPTCHA detected | `REQUIRES_REVIEW` — `CAPTCHA` |
+| Page load timeout | `FAILED` — `TIMEOUT` step |
+| Form validation errors | `FAILED` — lists error messages |
+| Email verification prompt | `SUBMITTED` — treated as successful (application received) |
+| Success page detected | `SUBMITTED` |
+| Unexpected exception | `FAILED` — full error message and step |
+
+---
+
+## Review Queue Triggers
+
+These conditions cause the service to return `REQUIRES_REVIEW` instead of `FAILED` or `SUBMITTED`. The NestJS service routes these to the human Review Queue:
+
+| Trigger | reviewReason |
+|---|---|
+| Real CAPTCHA challenge detected | `CAPTCHA` |
+| Required field has no LLM answer | `UNKNOWN_QUESTION` |
+| Essay/open-ended question | `ESSAY_REQUIRED` |
+| Manual approval needed | `APPROVAL_NEEDED` |
+| Email verification timeout | `CAPTCHA_TIMEOUT` |
 
 ---
 
 ## Logging
 
-The service logs all key events to the console using Python's standard logging module at DEBUG and INFO levels.
+All key events are logged to console with timestamps and log levels.
 
 ```
-[INFO]  Application request received - platform: greenhouse | email: johndoe@gmail.com
-[INFO]  Starting automation for John Doe | https://job-boards.greenhouse.io/...
-[INFO]  Navigating to job URL
-[INFO]  Filling first name
-[INFO]  Filling last name
-[INFO]  Filling email
-[INFO]  Filling phone
-[INFO]  Screenshot: basic fields filled
-[INFO]  Uploading resume
-[INFO]  Screenshot: resume uploaded
-[INFO]  Clicking submit button
-[INFO]  Screenshot: after submit
-[INFO]  Submission successful
-[INFO]  Returning result: status=SUBMITTED
+[INFO]  Application request received | platform=greenhouse | email=... | url=...
+[INFO]  Automation starting | platform=greenhouse | ...
+[INFO]  Routing to Greenhouse handler
+[INFO]  Greenhouse handler | email | 14 questions | 8 LLM answers
+[INFO]  Downloading resume from: https://...
+[INFO]  Resume downloaded to temp: C:\...\tmp7jjz6cfj.pdf
+[INFO]  React Select filled: #question_5792560006 → Yes
+[INFO]  GDPR checked: #gdpr_consent_given_1
+[INFO]  About to submit — final screenshot taken
+[INFO]  Email verification prompt detected — application submitted successfully
+[INFO]  Automation complete | status=SUBMITTED
 ```
 
 ---
 
 ## Screenshots
 
-Screenshots are automatically saved to `C:/automation/scripts/screenshots/` at every major step of the automation. This allows debugging of any failures without re-running the browser.
+Screenshots are saved to `scripts/screenshots/` at every major step.
 
 | File | Captured At |
 |---|---|
-| `00_page_loaded.png` | After page navigation |
-| `01_basic_fields.png` | After filling name, email, phone |
-| `02_resume_uploaded.png` | After CV file upload |
-| `03_clearance_q1.png` | After first custom question |
-| `04_clearance_q2.png` | After second custom question |
-| `05_all_questions.png` | After all questions filled |
-| `06_gdpr_checked.png` | After GDPR consent checkbox |
-| `07_after_submit.png` | After form submission |
-| `08_validation_errors.png` | If form validation fails |
-| `error_timeout.png` | If a timeout occurs |
-| `error_general.png` | If an unexpected error occurs |
+| `gh_00_loaded.png` | After page navigation |
+| `gh_01_identity.png` | After filling name, email, phone |
+| `gh_02_resume.png` | After resume upload |
+| `gh_03_questions.png` | After dynamic question fill |
+| `gh_04_submitted.png` | After form submission |
+| `gh_05_verified.png` | After email verification (if completed) |
+| `gh_05_errors.png` | If form validation fails |
+| `gh_unanswered_{name}.png` | When a required field has no LLM answer |
+| `gh_error_timeout.png` | On page load or wait timeout |
+| `gh_error_general.png` | On unexpected exception |
+
+Screenshots are excluded from Git via `.gitignore`.
 
 ---
 
 ## Related Services
 
-This service is part of a polyglot microservices system. It only handles browser automation and does not function independently as a standalone application submission tool.
+This service is the automation execution layer of the **JobConcierge** system. It does not function as a standalone application tool — it depends on receiving fully resolved payloads from the NestJS orchestration service.
 
-| Service | Language | Port | Location |
+| Service | Language | Port | Role |
 |---|---|---|---|
-| Job Application Service | Java / Spring Boot | 8080 | `job-application-service/` |
-| Automation Service | Python / FastAPI + Playwright | 8081 | This repository |
+| NestJS Orchestration Service | TypeScript / NestJS | 3000 | Orchestration, LLM mapping, queue, DB |
+| Python Automation Service | Python / FastAPI + Playwright | 8000 | Browser automation execution |
+| Spring Boot Scout Scraper | Java / Spring Boot | — | Job scraping (WeWorkRemotely, Remotive) |
 
-See the **Job Application Service README** for full setup instructions for the Spring Boot service and database configuration.
+The NestJS service handles all of: client management, resume storage (Supabase), LLM field mapping (Gemini), saved answers caching, BullMQ job queue, application record persistence, and review queue routing. This service only handles the browser.
